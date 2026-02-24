@@ -3,5 +3,5 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="Hook Detector/Hook Detector.vcxproj" />
+  <Project Path="Hook Detector/Hook Detector.vcxproj" Id="dcf64a16-32b8-4782-b6e3-7e6bca6cee37" />
 </Solution>

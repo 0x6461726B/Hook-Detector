@@ -7,6 +7,8 @@
 #include <string>
 #include <tlhelp32.h>
 #include "winternl.h"
+#include <format>
+#include "securitybaseapi.h"
 #pragma comment(lib, "d3d11.lib")
 
 
@@ -118,6 +120,125 @@ bool isInTextSection(BYTE* fileBuffer, DWORD rva) {
     return false;
 }
 
+void enableDebugPrivilige() {
+    HANDLE token;
+    OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token);
+
+    TOKEN_PRIVILEGES tp;
+    LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &tp.Privileges[0].Luid);
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    AdjustTokenPrivileges(token, FALSE, &tp, 0, NULL, NULL);
+    CloseHandle(token);
+
+}
+
+uintptr_t resolveHookTarget(uint8_t* hookedBytes, uintptr_t address, HANDLE handle, int depth = 0) {
+    if (depth >= 5) return 0;
+
+
+    uintptr_t target = 0;
+
+    // mov r64, imm64
+    if ((hookedBytes[0] == 0x48 || hookedBytes[0] == 0x49) &&
+        (hookedBytes[1] >= 0xB8 && hookedBytes[1] <= 0xBF)) {
+       target = *reinterpret_cast<uintptr_t*>(hookedBytes + 2);
+    }
+
+    // jmp, xxxxx
+    else if (hookedBytes[0] == 0xE9) {
+        int32_t rel = *reinterpret_cast<int32_t*>(hookedBytes + 1);
+        target = address + 5 + rel;
+
+    }
+    //jmp to pointer, so we need to deref it to get real address
+    else if (hookedBytes[0] == 0xFF && hookedBytes[1] == 0x25) {
+        int32_t rel = *reinterpret_cast<int32_t*>(hookedBytes + 2);
+        uintptr_t ptrAddr = address + 6 + rel;
+        ReadProcessMemory(handle, (LPCVOID)ptrAddr, &target, sizeof(target), nullptr);
+    }
+
+    if (target == 0) return 0;
+
+
+    // follow jump chains recursively (e.g. E9 -> FF 25 -> final destination)
+    BYTE nextBytes[16] = { 0 };
+    if (ReadProcessMemory(handle, (LPCVOID)target, nextBytes, sizeof(nextBytes), nullptr)) {
+        if (nextBytes[0] == 0xE9 || nextBytes[0] == 0xFF ||
+            ((nextBytes[0] == 0x48 || nextBytes[0] == 0x49) && nextBytes[1] >= 0xB8 && nextBytes[1] <= 0xBF)) {
+            return resolveHookTarget(nextBytes, target, handle, depth + 1);
+        }
+    }
+    return target;
+}
+
+std::string resolveAddressToModule(uintptr_t address, int pid) {
+    auto handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+
+    if (!handle) {
+        auto error = GetLastError();
+        auto buf = std::format("[!] Failed to open handle to process: {}", error);
+        g_results.push_back({ buf, Severity::Critical });
+        return "";
+    }
+
+    PROCESS_BASIC_INFORMATION pbi;
+    ULONG returnLength;
+    fNtQueryInformationProcess(handle, 0, &pbi, sizeof(pbi), &returnLength);
+
+    PEB peb;
+    ReadProcessMemory(handle, pbi.PebBaseAddress, &peb, sizeof(peb), nullptr);
+
+    PEB_LDR_DATA ldr;
+    ReadProcessMemory(handle, peb.Ldr, &ldr, sizeof(ldr), nullptr);
+
+    LIST_ENTRY* head = (LIST_ENTRY*)((uintptr_t)peb.Ldr + offsetof(PEB_LDR_DATA, InMemoryOrderModuleList));
+    LIST_ENTRY* current = ldr.InMemoryOrderModuleList.Flink;
+
+   // ReadProcessMemory(handle, current, &current, sizeof(current), nullptr);
+
+
+    while (current != head) {
+        LDR_DATA_TABLE_ENTRY entry;
+        ReadProcessMemory(handle, (BYTE*)current - 0x10, &entry, sizeof(entry), nullptr);
+        
+        IMAGE_DOS_HEADER dos;
+        ReadProcessMemory(handle, entry.DllBase, &dos, sizeof(dos), nullptr);
+        IMAGE_NT_HEADERS ntHeaders;
+        ReadProcessMemory(handle, (BYTE*)entry.DllBase + dos.e_lfanew, &ntHeaders, sizeof(ntHeaders), nullptr);
+
+        auto base = (uintptr_t)entry.DllBase;
+        auto size = ntHeaders.OptionalHeader.SizeOfImage;
+
+        if (address >= base && address < base + size) {
+            wchar_t fullDllName[MAX_PATH];
+            ReadProcessMemory(handle, entry.FullDllName.Buffer, &fullDllName, entry.FullDllName.Length, nullptr);
+            fullDllName[entry.FullDllName.Length / sizeof(wchar_t)] = L'\0';
+
+            auto basename = wcsrchr(fullDllName, L'\\');
+            if (basename) basename++; // skip the double backslash
+            else basename = fullDllName;
+
+
+
+
+
+            std::wstring wDllName(basename);
+            std::string sDllName(wDllName.begin(), wDllName.end());
+
+            auto offset = address - base;
+
+            CloseHandle(handle);
+
+            return std::format("{}-0x{:X}", sDllName.c_str(), offset);
+        }
+        current = entry.InMemoryOrderLinks.Flink;
+    }
+    CloseHandle(handle);
+    return std::format("Unkown region-{:X}", address);
+}
+
 const wchar_t* targetModules[] = {
     L"ntdll.dll",
     L"kernel32.dll",
@@ -136,7 +257,9 @@ void RunScan(int pid) {
     auto handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
     
     if (!handle) {
-        g_results.push_back({ "[!] Failed to open handle to process.", Severity::Critical});
+        auto error = GetLastError();
+        auto buf = std::format("[!] Failed to open handle to process: {}", error);
+        g_results.push_back({ buf, Severity::Critical});
         return;
     }
 
@@ -168,17 +291,17 @@ void RunScan(int pid) {
         if (baseName) baseName++;
         else baseName = dllName;
 
-        bool isTarget = false;
-        for (auto& mod : targetModules) {
-            if (_wcsicmp(baseName, mod) == 0) {
-                isTarget = true;
-                break;
-            }
-        }
-        if (!isTarget) {
-            current = entry.InMemoryOrderLinks.Flink;
-            continue;
-        }
+        //bool isTarget = false;
+        //for (auto& mod : targetModules) {
+        //    if (_wcsicmp(baseName, mod) == 0) {
+        //        isTarget = true;
+        //        break;
+        //    }
+        //}
+        //if (!isTarget) {
+        //    current = entry.InMemoryOrderLinks.Flink;
+        //    continue;
+        //}
 
 
 
@@ -238,9 +361,15 @@ void RunScan(int pid) {
                     ro += sprintf_s(remoteHex + ro, sizeof(remoteHex) - ro, "%02X ", remoteBytes[j]);
                 }
 
-                char buf[512];
-                sprintf_s(buf, sizeof(buf), "[!] Hook detected: %s!%s\n    Clean:  %s\n    Hooked: %s", dllNameC, funcName, cleanHex, remoteHex);
-                g_results.push_back({ buf, Severity::Detection });
+                auto funcAddress = (uintptr_t)entry.DllBase + funcRVA;
+                auto targetAddress = resolveHookTarget(remoteBytes, funcAddress, handle);
+                auto moduleNameAndOffset = resolveAddressToModule(targetAddress, pid);
+
+                auto buf = std::format("[!] Hook detected : {}!{}\n    Clean : {}\n    Hooked: {}\n    Resolves to: {}", dllNameC, funcName, cleanHex, remoteHex, moduleNameAndOffset.c_str());
+
+                /*char buf[512];
+                sprintf_s(buf, sizeof(buf), "[!] Hook detected: %s!%s\n    Clean:  %s\n    Hooked: %s", dllNameC, funcName, cleanHex, remoteHex);*/
+                g_results.push_back({ buf.c_str(), Severity::Detection});
             }
         }
 
@@ -342,8 +471,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     fNtQueryInformationProcess = (NtQueryInformationProcess_t*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
 
-
-
+    enableDebugPrivilige();
 
 
     WNDCLASSEXW wc = {
