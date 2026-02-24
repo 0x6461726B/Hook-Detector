@@ -173,15 +173,7 @@ uintptr_t resolveHookTarget(uint8_t* hookedBytes, uintptr_t address, HANDLE hand
     return target;
 }
 
-std::string resolveAddressToModule(uintptr_t address, int pid) {
-    auto handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-
-    if (!handle) {
-        auto error = GetLastError();
-        auto buf = std::format("[!] Failed to open handle to process: {}", error);
-        g_results.push_back({ buf, Severity::Critical });
-        return "";
-    }
+std::string resolveAddressToModule(uintptr_t address, HANDLE handle) {
 
     PROCESS_BASIC_INFORMATION pbi;
     ULONG returnLength;
@@ -363,7 +355,7 @@ void RunScan(int pid) {
 
                 auto funcAddress = (uintptr_t)entry.DllBase + funcRVA;
                 auto targetAddress = resolveHookTarget(remoteBytes, funcAddress, handle);
-                auto moduleNameAndOffset = resolveAddressToModule(targetAddress, pid);
+                auto moduleNameAndOffset = resolveAddressToModule(targetAddress, handle);
 
                 auto buf = std::format("[!] Hook detected : {}!{}\n    Clean : {}\n    Hooked: {}\n    Resolves to: {}", dllNameC, funcName, cleanHex, remoteHex, moduleNameAndOffset.c_str());
 
