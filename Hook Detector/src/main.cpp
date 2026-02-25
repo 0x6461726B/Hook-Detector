@@ -8,22 +8,23 @@
 #include <tlhelp32.h>
 #include "winternl.h"
 #include <format>
+#include <thread>
 #include "securitybaseapi.h"
 #pragma comment(lib, "d3d11.lib")
 
 
-// DirectX globals
+
+
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
-// Forward declarations
-bool CreateDeviceD3D(HWND hWnd);
-void CleanupDeviceD3D();
-void CreateRenderTarget();
-void CleanupRenderTarget();
-LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+bool createDeviceD3D(HWND hWnd);
+void cleanupDeviceD3D();
+void createRenderTarget();
+void cleanupRenderTarget();
+LRESULT WINAPI wndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 
@@ -48,7 +49,7 @@ enum class Severity {
     Critical
 };
 
-ImVec4 GetSeverityColor(Severity s) {
+ImVec4 getSeverityColor(Severity s) {
     switch (s) {
     case Severity::Info:      return { 0.4f, 1.0f, 0.4f, 1.0f };   // green
     case Severity::Warning:   return { 1.0f, 0.8f, 0.2f, 1.0f };   // yellow
@@ -75,7 +76,7 @@ static int g_selectedPid = 0;
 static bool g_scanning = false;
 
 
-void RefreshProcessList() {
+void refreshProcessList() {
     g_processes.clear();
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return;
@@ -120,7 +121,7 @@ bool isInTextSection(BYTE* fileBuffer, DWORD rva) {
     return false;
 }
 
-void enableDebugPrivilige() {
+void enableDebugPrivilege() {
     HANDLE token;
     OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &token);
 
@@ -188,9 +189,6 @@ std::string resolveAddressToModule(uintptr_t address, HANDLE handle) {
     LIST_ENTRY* head = (LIST_ENTRY*)((uintptr_t)peb.Ldr + offsetof(PEB_LDR_DATA, InMemoryOrderModuleList));
     LIST_ENTRY* current = ldr.InMemoryOrderModuleList.Flink;
 
-   // ReadProcessMemory(handle, current, &current, sizeof(current), nullptr);
-
-
     while (current != head) {
         LDR_DATA_TABLE_ENTRY entry;
         ReadProcessMemory(handle, (BYTE*)current - 0x10, &entry, sizeof(entry), nullptr);
@@ -212,35 +210,19 @@ std::string resolveAddressToModule(uintptr_t address, HANDLE handle) {
             if (basename) basename++; // skip the double backslash
             else basename = fullDllName;
 
-
-
-
-
             std::wstring wDllName(basename);
             std::string sDllName(wDllName.begin(), wDllName.end());
 
             auto offset = address - base;
 
-            CloseHandle(handle);
-
             return std::format("{}-0x{:X}", sDllName.c_str(), offset);
         }
         current = entry.InMemoryOrderLinks.Flink;
     }
-    CloseHandle(handle);
     return std::format("Unkown region-{:X}", address);
 }
 
-const wchar_t* targetModules[] = {
-    L"ntdll.dll",
-    L"kernel32.dll",
-    L"kernelbase.dll",
-    L"user32.dll",
-    L"win32u.dll"
-};
-
-
-void RunScan(int pid) {
+void runScan(int pid) {
     g_results.clear();
     g_scanning = true;
 
@@ -250,8 +232,7 @@ void RunScan(int pid) {
     
     if (!handle) {
         auto error = GetLastError();
-        auto buf = std::format("[!] Failed to open handle to process: {}", error);
-        g_results.push_back({ buf, Severity::Critical});
+        g_results.push_back({ std::format("[!] Failed to open handle to process: {}", error), Severity::Critical});
         return;
     }
 
@@ -283,41 +264,33 @@ void RunScan(int pid) {
         if (baseName) baseName++;
         else baseName = dllName;
 
-        //bool isTarget = false;
-        //for (auto& mod : targetModules) {
-        //    if (_wcsicmp(baseName, mod) == 0) {
-        //        isTarget = true;
-        //        break;
-        //    }
-        //}
-        //if (!isTarget) {
-        //    current = entry.InMemoryOrderLinks.Flink;
-        //    continue;
-        //}
-
-
+        auto base = (uintptr_t)entry.DllBase;
 
         IMAGE_DOS_HEADER dos;
-        ReadProcessMemory(handle, entry.DllBase, &dos, sizeof(dos), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)base, &dos, sizeof(dos), nullptr);
         IMAGE_NT_HEADERS ntHeaders;
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + dos.e_lfanew, &ntHeaders, sizeof(ntHeaders), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)(base + dos.e_lfanew), &ntHeaders, sizeof(ntHeaders), nullptr);
 
         IMAGE_EXPORT_DIRECTORY exportDir;
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress, &exportDir, sizeof(exportDir), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)(base + ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress), &exportDir, sizeof(exportDir), nullptr);
 
         auto exportDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
         auto exportDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
 
         auto addressOfNames = new DWORD[exportDir.NumberOfNames];
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + exportDir.AddressOfNames, addressOfNames, exportDir.NumberOfNames * sizeof(DWORD), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfNames), addressOfNames, exportDir.NumberOfNames * sizeof(DWORD), nullptr);
 
         auto addressOfFunctions = new DWORD[exportDir.NumberOfFunctions];
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + exportDir.AddressOfFunctions, addressOfFunctions, exportDir.NumberOfFunctions * sizeof(DWORD), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfFunctions), addressOfFunctions, exportDir.NumberOfFunctions * sizeof(DWORD), nullptr);
 
         auto addressOfOrdinals = new WORD[exportDir.NumberOfNames];
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + exportDir.AddressOfNameOrdinals, addressOfOrdinals, exportDir.NumberOfNames * sizeof(WORD), nullptr);
+        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfNameOrdinals), addressOfOrdinals, exportDir.NumberOfNames * sizeof(WORD), nullptr);
 
         HANDLE hFile = CreateFileW(dllName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            current = entry.InMemoryOrderLinks.Flink;
+            return;
+        }
         HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
         auto mappedFile = (BYTE*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
         CloseHandle(hFile);
@@ -326,9 +299,7 @@ void RunScan(int pid) {
         size_t converted;
         wcstombs_s(&converted, dllNameC, baseName, _TRUNCATE);
 
-        char modBuf[512];
-        sprintf_s(modBuf, sizeof(modBuf), "[+] Scanning: %s (%d exports)", dllNameC, exportDir.NumberOfNames);
-        g_results.push_back({ modBuf, Severity::Info });
+        g_results.push_back({ std::format("[+] Scanning: {} ({} exports)", dllNameC, exportDir.NumberOfNames), Severity::Info});
 
         for (DWORD i = 0; i < exportDir.NumberOfNames; i++) {
             DWORD funcRVA = addressOfFunctions[addressOfOrdinals[i]];
@@ -338,13 +309,13 @@ void RunScan(int pid) {
             if (!isInTextSection(mappedFile, funcRVA)) continue;
 
             BYTE remoteBytes[16] = { 0 };
-            ReadProcessMemory(handle, (BYTE*)entry.DllBase + funcRVA, remoteBytes, sizeof(remoteBytes), nullptr);
+            ReadProcessMemory(handle, (LPCVOID)(base + funcRVA), remoteBytes, sizeof(remoteBytes), nullptr);
 
             auto cleanBytes = mappedFile + funcRVA;
 
             if (memcmp(remoteBytes, cleanBytes, 16) != 0) {
                 char funcName[256];
-                ReadProcessMemory(handle, (BYTE*)entry.DllBase + addressOfNames[i], funcName, sizeof(funcName), nullptr);
+                ReadProcessMemory(handle, (LPCVOID)(base + addressOfNames[i]), funcName, sizeof(funcName), nullptr);
 
                 char cleanHex[128], remoteHex[128];
                 int co = 0, ro = 0;
@@ -353,15 +324,11 @@ void RunScan(int pid) {
                     ro += sprintf_s(remoteHex + ro, sizeof(remoteHex) - ro, "%02X ", remoteBytes[j]);
                 }
 
-                auto funcAddress = (uintptr_t)entry.DllBase + funcRVA;
+                auto funcAddress = base + funcRVA;
                 auto targetAddress = resolveHookTarget(remoteBytes, funcAddress, handle);
                 auto moduleNameAndOffset = resolveAddressToModule(targetAddress, handle);
 
-                auto buf = std::format("[!] Hook detected : {}!{}\n    Clean : {}\n    Hooked: {}\n    Resolves to: {}", dllNameC, funcName, cleanHex, remoteHex, moduleNameAndOffset.c_str());
-
-                /*char buf[512];
-                sprintf_s(buf, sizeof(buf), "[!] Hook detected: %s!%s\n    Clean:  %s\n    Hooked: %s", dllNameC, funcName, cleanHex, remoteHex);*/
-                g_results.push_back({ buf.c_str(), Severity::Detection});
+                g_results.push_back({ std::format("[!] Hook detected : {}!{}\n    Clean : {}\n    Hooked: {}\n    Resolves to: {}", dllNameC, funcName, cleanHex, remoteHex, moduleNameAndOffset.c_str()), Severity::Detection});
             }
         }
 
@@ -386,8 +353,7 @@ void RunScan(int pid) {
 // IMGUI RENDER
 // ============================================================
 
-void RenderUI() {
-    // Main window fills the viewport
+void renderUI() {
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImGui::GetIO().DisplaySize);
     ImGui::Begin("Scanner", nullptr,
@@ -396,17 +362,15 @@ void RenderUI() {
         ImGuiWindowFlags_NoCollapse |
         ImGuiWindowFlags_NoTitleBar);
 
-    // Header
     ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "Hook Detector");
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Process selection
     static int selectedIndex = -1;
     static char preview[512] = "Select process...";
 
     if (ImGui::Button("Refresh")) {
-        RefreshProcessList();
+        refreshProcessList();
     }
     ImGui::SameLine();
 
@@ -431,7 +395,12 @@ void RenderUI() {
 
     ImGui::SameLine();
     if (ImGui::Button("Scan", ImVec2(100, 0))) {
-        RunScan(g_selectedPid);
+        if (!g_scanning) {
+            int pid = g_selectedPid;
+            std::thread([pid]() {
+                runScan(pid);
+                }).detach();
+        }
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear", ImVec2(100, 0))) {
@@ -442,12 +411,11 @@ void RenderUI() {
     ImGui::Separator();
     ImGui::Spacing();
 
-    // Results panel
     ImGui::Text("Results (%d)", (int)g_results.size());
     ImGui::BeginChild("Results", ImVec2(0, 0), true);
 
     for (auto& result : g_results) {
-        ImGui::TextColored(GetSeverityColor(result.severity), "%s", result.description.c_str());
+        ImGui::TextColored(getSeverityColor(result.severity), "%s", result.description.c_str());
     }
 
     ImGui::EndChild();
@@ -463,11 +431,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 
     fNtQueryInformationProcess = (NtQueryInformationProcess_t*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
 
-    enableDebugPrivilige();
+    enableDebugPrivilege();
 
 
     WNDCLASSEXW wc = {
-        sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
+        sizeof(wc), CS_CLASSDC, wndProc, 0L, 0L,
         GetModuleHandle(nullptr), nullptr, nullptr, nullptr, nullptr,
         L"ScannerClass", nullptr
     };
@@ -480,8 +448,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         nullptr, nullptr, wc.hInstance, nullptr
     );
 
-    if (!CreateDeviceD3D(hwnd)) {
-        CleanupDeviceD3D();
+    if (!createDeviceD3D(hwnd)) {
+        cleanupDeviceD3D();
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
@@ -489,13 +457,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ShowWindow(hwnd, SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
-    // Setup ImGui
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
-    // Dark theme with custom accent
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 0.0f;
@@ -505,7 +471,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     style.FramePadding = ImVec2(8, 4);
     style.ItemSpacing = ImVec2(8, 6);
 
-    // Accent colors
     style.Colors[ImGuiCol_Button] = ImVec4(0.20f, 0.40f, 0.65f, 1.00f);
     style.Colors[ImGuiCol_ButtonHovered] = ImVec4(0.28f, 0.50f, 0.75f, 1.00f);
     style.Colors[ImGuiCol_ButtonActive] = ImVec4(0.15f, 0.35f, 0.60f, 1.00f);
@@ -516,11 +481,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Main loop
     MSG msg;
     ZeroMemory(&msg, sizeof(msg));
 
-    RefreshProcessList();
+    refreshProcessList();
 
     while (msg.message != WM_QUIT) {
         if (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
@@ -533,7 +497,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        RenderUI();
+        renderUI();
 
         ImGui::Render();
         const float clear_color[4] = { 0.06f, 0.06f, 0.08f, 1.00f };
@@ -544,11 +508,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
         g_pSwapChain->Present(1, 0);
     }
 
-    // Cleanup
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
-    CleanupDeviceD3D();
+    cleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
@@ -559,7 +522,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
 // D3D11 HELPERS
 // ============================================================
 
-bool CreateDeviceD3D(HWND hWnd) {
+bool createDeviceD3D(HWND hWnd) {
     DXGI_SWAP_CHAIN_DESC sd = {};
     sd.BufferCount = 2;
     sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -576,38 +539,38 @@ bool CreateDeviceD3D(HWND hWnd) {
         &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
         return false;
 
-    CreateRenderTarget();
+    createRenderTarget();
     return true;
 }
 
-void CleanupDeviceD3D() {
-    CleanupRenderTarget();
+void cleanupDeviceD3D() {
+    cleanupRenderTarget();
     if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
     if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
     if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
 }
 
-void CreateRenderTarget() {
+void createRenderTarget() {
     ID3D11Texture2D* pBackBuffer;
     g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
     g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
     pBackBuffer->Release();
 }
 
-void CleanupRenderTarget() {
+void cleanupRenderTarget() {
     if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
 }
 
-LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+LRESULT WINAPI wndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
         return true;
 
     switch (msg) {
     case WM_SIZE:
         if (g_pd3dDevice && wParam != SIZE_MINIMIZED) {
-            CleanupRenderTarget();
+            cleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
-            CreateRenderTarget();
+            createRenderTarget();
         }
         return 0;
     case WM_DESTROY:
