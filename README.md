@@ -1,3 +1,8 @@
 # Hook Detector
 
-A usermode inline hook detection tool for Windows with a simple UI. Scans loaded modules in a target process and compares in-memory function bytes against clean copies loaded from disk.
+A usermode hook detection tool for Windows that scans remote processes for tampered code and redirected imports.
+
+## Features
+- Detects inline hooking
+- Detects IAT hooking
+- Manual PEB traversal with RPM
