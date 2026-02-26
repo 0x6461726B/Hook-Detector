@@ -10,6 +10,9 @@
 #include <format>
 #include <thread>
 #include "securitybaseapi.h"
+#include <iostream>
+#include <unordered_map>
+#include <algorithm>
 #pragma comment(lib, "d3d11.lib")
 
 
@@ -70,8 +73,20 @@ struct ProcessInfo {
     wchar_t name[MAX_PATH];
 };
 
+struct ModuleInfo {
+    std::string name;
+    std::wstring fullPath;
+    uintptr_t base;
+    DWORD size;
+    IMAGE_NT_HEADERS ntHeaders;
+    BYTE* mappedFile;
+    HANDLE hMapping;
+};
+
+static std::vector<ModuleInfo> g_modules;
 static std::vector<ProcessInfo> g_processes;
 static std::vector<ScanResult> g_results;
+static std::unordered_map<std::string, ModuleInfo*> g_moduleMap;
 static int g_selectedPid = 0;
 static bool g_scanning = false;
 
@@ -91,20 +106,6 @@ void refreshProcessList() {
         } while (Process32Next(snap, &pe));
     }
     CloseHandle(snap);
-}
-
-DWORD rvaToOffset(BYTE* fileBuffer, DWORD rva) {
-    auto dos = (IMAGE_DOS_HEADER*)fileBuffer;
-    auto ntHeaders = (IMAGE_NT_HEADERS*)(fileBuffer + dos->e_lfanew);
-    auto section = IMAGE_FIRST_SECTION(ntHeaders);
-
-    for (int i = 0; i < ntHeaders->FileHeader.NumberOfSections; i++) {
-        if (rva >= section[i].VirtualAddress &&
-            rva < section[i].VirtualAddress + section[i].Misc.VirtualSize) {
-            return rva - section[i].VirtualAddress + section[i].PointerToRawData;
-        }
-    }
-    return 0;
 }
 
 bool isInTextSection(BYTE* fileBuffer, DWORD rva) {
@@ -153,7 +154,7 @@ uintptr_t resolveHookTarget(uint8_t* hookedBytes, uintptr_t address, HANDLE hand
         target = address + 5 + rel;
 
     }
-    //jmp to pointer, so we need to deref it to get real address
+    // jmp to pointer, so we need to deref it to get real address
     else if (hookedBytes[0] == 0xFF && hookedBytes[1] == 0x25) {
         int32_t rel = *reinterpret_cast<int32_t*>(hookedBytes + 2);
         uintptr_t ptrAddr = address + 6 + rel;
@@ -174,7 +175,24 @@ uintptr_t resolveHookTarget(uint8_t* hookedBytes, uintptr_t address, HANDLE hand
     return target;
 }
 
-std::string resolveAddressToModule(uintptr_t address, HANDLE handle) {
+void cleanupModules() {
+    for (auto& mod : g_modules) {
+        if (mod.mappedFile) {
+            UnmapViewOfFile(mod.mappedFile);
+            mod.mappedFile = nullptr;
+        }
+        if (mod.hMapping) {
+            CloseHandle(mod.hMapping);
+            mod.hMapping = nullptr;
+        }
+    }
+    g_modules.clear();
+    g_moduleMap.clear();
+}
+
+
+void cacheModules(HANDLE handle) {
+    cleanupModules();
 
     PROCESS_BASIC_INFORMATION pbi;
     ULONG returnLength;
@@ -192,34 +210,263 @@ std::string resolveAddressToModule(uintptr_t address, HANDLE handle) {
     while (current != head) {
         LDR_DATA_TABLE_ENTRY entry;
         ReadProcessMemory(handle, (BYTE*)current - 0x10, &entry, sizeof(entry), nullptr);
-        
-        IMAGE_DOS_HEADER dos;
-        ReadProcessMemory(handle, entry.DllBase, &dos, sizeof(dos), nullptr);
-        IMAGE_NT_HEADERS ntHeaders;
-        ReadProcessMemory(handle, (BYTE*)entry.DllBase + dos.e_lfanew, &ntHeaders, sizeof(ntHeaders), nullptr);
+
+        wchar_t dllName[MAX_PATH];
+        ReadProcessMemory(handle, entry.FullDllName.Buffer, dllName, entry.FullDllName.Length, nullptr);
+        dllName[entry.FullDllName.Length / sizeof(wchar_t)] = L'\0';
 
         auto base = (uintptr_t)entry.DllBase;
-        auto size = ntHeaders.OptionalHeader.SizeOfImage;
 
-        if (address >= base && address < base + size) {
-            wchar_t fullDllName[MAX_PATH];
-            ReadProcessMemory(handle, entry.FullDllName.Buffer, &fullDllName, entry.FullDllName.Length, nullptr);
-            fullDllName[entry.FullDllName.Length / sizeof(wchar_t)] = L'\0';
+        IMAGE_DOS_HEADER dos;
+        ReadProcessMemory(handle, (LPCVOID)base, &dos, sizeof(dos), nullptr);
+        IMAGE_NT_HEADERS nt;
+        ReadProcessMemory(handle, (LPCVOID)(base + dos.e_lfanew), &nt, sizeof(nt), nullptr);
 
-            auto basename = wcsrchr(fullDllName, L'\\');
-            if (basename) basename++; // skip the double backslash
-            else basename = fullDllName;
+        wchar_t* baseName = wcsrchr(dllName, L'\\');
+        baseName = baseName ? baseName + 1 : dllName;
 
-            std::wstring wDllName(basename);
-            std::string sDllName(wDllName.begin(), wDllName.end());
+        char nameA[MAX_PATH];
+        size_t conv;
+        wcstombs_s(&conv, nameA, baseName, _TRUNCATE);
 
-            auto offset = address - base;
+        BYTE* mappedFile = nullptr;
+        HANDLE hMapping = nullptr;
 
-            return std::format("{}-0x{:X}", sDllName.c_str(), offset);
+        HANDLE hFile = CreateFileW(dllName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, 0);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
+            if (hMapping) {
+                mappedFile = (BYTE*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
+            }
+            CloseHandle(hFile);
         }
+
+
+        g_modules.push_back({
+            nameA,
+            dllName,
+            base,
+            nt.OptionalHeader.SizeOfImage,
+            nt,
+            mappedFile,
+            hMapping
+            });
+
         current = entry.InMemoryOrderLinks.Flink;
     }
+
+    for (auto& mod : g_modules) {
+        std::string lower = mod.name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        g_moduleMap[lower] = &mod;
+    }
+}
+
+std::string resolveAddressToModule(uintptr_t address) {
+
+    for (auto& mod : g_modules) {
+        if (address >= mod.base && address < mod.base + mod.size) {
+            auto offset = address - mod.base;
+            return std::format("{}-0x{:X}", mod.name, offset);
+        }
+    }
     return std::format("Unkown region-{:X}", address);
+}
+
+
+
+
+
+DWORD getExportRVA(BYTE* mappedFile, const char* funcName) {
+    auto dos = (IMAGE_DOS_HEADER*)mappedFile;
+    auto nt = (IMAGE_NT_HEADERS*)(mappedFile + dos->e_lfanew);
+
+    if (nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress == 0)
+        return 0;
+
+    auto exportDir = (IMAGE_EXPORT_DIRECTORY*)(mappedFile +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
+
+    auto names = (DWORD*)(mappedFile + exportDir->AddressOfNames);
+    auto functions = (DWORD*)(mappedFile + exportDir->AddressOfFunctions);
+    auto ordinals = (WORD*)(mappedFile + exportDir->AddressOfNameOrdinals);
+
+    for (DWORD i = 0; i < exportDir->NumberOfNames; i++) {
+        auto name = (const char*)(mappedFile + names[i]);
+        if (strcmp(name, funcName) == 0) {
+            return functions[ordinals[i]];
+        }
+    }
+    return 0;
+}
+
+void checkIATHooks(HANDLE handle, ModuleInfo& mod) {
+    DWORD importRVA = mod.ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress;
+    DWORD importSize = mod.ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].Size;
+
+    if (importRVA == 0 || importSize == 0) return;
+
+    DWORD offset = importRVA;
+    IMAGE_IMPORT_DESCRIPTOR importDesc{};
+
+    while (true) {
+        ReadProcessMemory(handle, (LPCVOID)(mod.base + offset), &importDesc, sizeof(importDesc), nullptr);
+        if (importDesc.Name == NULL) break;
+
+        if (importDesc.OriginalFirstThunk == 0) {
+            offset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            continue;
+        }
+
+        char libName[MAX_PATH]{};
+        ReadProcessMemory(handle, (LPCVOID)(mod.base + importDesc.Name), libName, sizeof(libName) - 1, nullptr);
+
+        if (strncmp(libName, "api-ms-win-", 11) == 0 || strncmp(libName, "ext-ms-", 7) == 0) {
+            offset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            continue;
+        }
+
+
+        std::string lib(libName);
+        std::transform(lib.begin(), lib.end(), lib.begin(), ::tolower);
+        auto it = g_moduleMap.find(lib);
+
+        if (it == g_moduleMap.end()) {
+            offset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+            continue;
+        }
+
+       // std::cout << lib << std::endl;
+        ModuleInfo* importedMod = it->second;
+
+        DWORD iatOffset = importDesc.FirstThunk;
+        DWORD intOffset = importDesc.OriginalFirstThunk;
+        IMAGE_THUNK_DATA iat{}, intThunk{};
+
+        while (true) {
+            ReadProcessMemory(handle, (LPCVOID)(mod.base + intOffset), &intThunk, sizeof(intThunk), nullptr);
+            ReadProcessMemory(handle, (LPCVOID)(mod.base + iatOffset), &iat, sizeof(iat), nullptr);
+
+            if (intThunk.u1.AddressOfData == NULL) break;
+
+            if (IMAGE_SNAP_BY_ORDINAL(intThunk.u1.Ordinal)) {
+                intOffset += sizeof(IMAGE_THUNK_DATA);
+                iatOffset += sizeof(IMAGE_THUNK_DATA);
+                continue;
+            }
+
+            // IMAGE_IMPORT_BY_NAME = { WORD Hint, CHAR Name[1] }
+            // Name[1] is a flexible array - actual string extends beyond the struct
+            // We skip Hint (2 bytes) and read the name string directly
+            char funcName[MAX_PATH]{};
+            ReadProcessMemory(handle, (LPCVOID)(mod.base + intThunk.u1.AddressOfData + sizeof(WORD)), funcName, sizeof(funcName), nullptr); 
+
+            DWORD expectedRVA = getExportRVA(importedMod->mappedFile, funcName);
+            if (expectedRVA == 0) {
+                intOffset += sizeof(IMAGE_THUNK_DATA);
+                iatOffset += sizeof(IMAGE_THUNK_DATA);
+                continue;
+            }
+
+            auto& exportEntry = importedMod->ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (expectedRVA >= exportEntry.VirtualAddress &&
+                expectedRVA < exportEntry.VirtualAddress + exportEntry.Size) {
+                iatOffset += sizeof(IMAGE_THUNK_DATA);
+                intOffset += sizeof(IMAGE_THUNK_DATA);
+                continue;
+            }
+
+
+            uintptr_t expected = importedMod->base + expectedRVA;
+
+            if (iat.u1.Function != expected) {
+                auto target = resolveAddressToModule(iat.u1.Function);
+                g_results.push_back({
+                    std::format("[!] IAT Hook: {}!{}\n    Expected: 0x{:X} ({}+0x{:X})\n    Actual:   0x{:X} ({})",
+                        mod.name, funcName,
+                        expected, libName, expectedRVA,
+                        iat.u1.Function, target),
+                    Severity::Detection
+                    });
+            }
+
+            iatOffset += sizeof(IMAGE_THUNK_DATA);
+            intOffset += sizeof(IMAGE_THUNK_DATA);
+
+
+        }
+        offset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    }
+
+}
+
+void checkInlineHooks(HANDLE handle, ModuleInfo& mod) {
+    auto exportDirRVA = mod.ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+    auto exportDirSize = mod.ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+
+    if (exportDirRVA == 0 || exportDirSize == 0) return;
+    if (!mod.mappedFile) return;
+
+    IMAGE_EXPORT_DIRECTORY exportDir;
+    ReadProcessMemory(handle, (LPCVOID)(mod.base + exportDirRVA), &exportDir, sizeof(exportDir), nullptr);
+
+    if (exportDir.NumberOfNames == 0 || exportDir.NumberOfFunctions == 0) return;
+
+    auto addressOfNames = new DWORD[exportDir.NumberOfNames];
+    ReadProcessMemory(handle, (LPCVOID)(mod.base + exportDir.AddressOfNames),
+        addressOfNames, exportDir.NumberOfNames * sizeof(DWORD), nullptr);
+
+    auto addressOfFunctions = new DWORD[exportDir.NumberOfFunctions];
+    ReadProcessMemory(handle, (LPCVOID)(mod.base + exportDir.AddressOfFunctions),
+        addressOfFunctions, exportDir.NumberOfFunctions * sizeof(DWORD), nullptr);
+
+    auto addressOfOrdinals = new WORD[exportDir.NumberOfNames];
+    ReadProcessMemory(handle, (LPCVOID)(mod.base + exportDir.AddressOfNameOrdinals),
+        addressOfOrdinals, exportDir.NumberOfNames * sizeof(WORD), nullptr);
+
+    g_results.push_back({
+        std::format("[+] Scanning: {} ({} exports)", mod.name, exportDir.NumberOfNames),
+        Severity::Info
+        });
+
+    for (DWORD i = 0; i < exportDir.NumberOfNames; i++) {
+        DWORD funcRVA = addressOfFunctions[addressOfOrdinals[i]];
+
+        if (funcRVA == 0) continue;
+        if (funcRVA >= exportDirRVA && funcRVA < exportDirRVA + exportDirSize) continue;
+        if (!isInTextSection(mod.mappedFile, funcRVA)) continue;
+
+        BYTE remoteBytes[16] = { 0 };
+        ReadProcessMemory(handle, (LPCVOID)(mod.base + funcRVA), remoteBytes, sizeof(remoteBytes), nullptr);
+
+        auto cleanBytes = mod.mappedFile + funcRVA;
+
+        if (memcmp(remoteBytes, cleanBytes, 16) != 0) {
+            char funcName[256]{};
+            ReadProcessMemory(handle, (LPCVOID)(mod.base + addressOfNames[i]), funcName, sizeof(funcName) - 1, nullptr);
+
+            char cleanHex[128]{}, remoteHex[128]{};
+            int co = 0, ro = 0;
+            for (int j = 0; j < 16; j++) {
+                co += sprintf_s(cleanHex + co, sizeof(cleanHex) - co, "%02X ", cleanBytes[j]);
+                ro += sprintf_s(remoteHex + ro, sizeof(remoteHex) - ro, "%02X ", remoteBytes[j]);
+            }
+
+            auto funcAddress = mod.base + funcRVA;
+            auto targetAddress = resolveHookTarget(remoteBytes, funcAddress, handle);
+            auto targetModule = resolveAddressToModule(targetAddress);
+
+            g_results.push_back({
+                std::format("[!] Inline Hook: {}!{}\n    Clean:  {}\n    Hooked: {}\n    Target: {}",
+                    mod.name, funcName, cleanHex, remoteHex, targetModule),
+                Severity::Detection
+                });
+        }
+    }
+
+    delete[] addressOfNames;
+    delete[] addressOfFunctions;
+    delete[] addressOfOrdinals;
 }
 
 void runScan(int pid) {
@@ -232,119 +479,35 @@ void runScan(int pid) {
     
     if (!handle) {
         auto error = GetLastError();
-        g_results.push_back({ std::format("[!] Failed to open handle to process: {}", error), Severity::Critical});
+        g_results.push_back({
+            std::format("[!] Failed to open handle to process: {}", error),
+            Severity::Critical
+            });
+        g_scanning = false;
         return;
     }
 
-    PROCESS_BASIC_INFORMATION pbi;
-    ULONG returnLength;
-    fNtQueryInformationProcess(handle, 0, &pbi, sizeof(pbi), &returnLength);
+    cacheModules(handle);
 
-    PEB peb;
-    ReadProcessMemory(handle, pbi.PebBaseAddress, &peb, sizeof(peb), nullptr);
-
-    PEB_LDR_DATA ldr;
-    ReadProcessMemory(handle, peb.Ldr, &ldr, sizeof(ldr), nullptr);
-
-    LIST_ENTRY* head = (LIST_ENTRY*)((uintptr_t)peb.Ldr + offsetof(PEB_LDR_DATA, InMemoryOrderModuleList));
-    LIST_ENTRY* current = ldr.InMemoryOrderModuleList.Flink;
-
-    ReadProcessMemory(handle, current, &current, sizeof(current), nullptr);
+    g_results.push_back({
+        std::format("[+] Found {} modules", g_modules.size()),
+        Severity::Info
+        });
 
 
-    while (current != head) {
-        LDR_DATA_TABLE_ENTRY entry;
-        ReadProcessMemory(handle, (BYTE*)current - 0x10, &entry, sizeof(entry), nullptr);
 
-        wchar_t dllName[MAX_PATH];
-        ReadProcessMemory(handle, entry.FullDllName.Buffer, dllName, entry.FullDllName.Length, nullptr);
-        dllName[entry.FullDllName.Length / sizeof(wchar_t)] = L'\0';
-
-        wchar_t* baseName = wcsrchr(dllName, L'\\');
-        if (baseName) baseName++;
-        else baseName = dllName;
-
-        auto base = (uintptr_t)entry.DllBase;
-
-        IMAGE_DOS_HEADER dos;
-        ReadProcessMemory(handle, (LPCVOID)base, &dos, sizeof(dos), nullptr);
-        IMAGE_NT_HEADERS ntHeaders;
-        ReadProcessMemory(handle, (LPCVOID)(base + dos.e_lfanew), &ntHeaders, sizeof(ntHeaders), nullptr);
-
-        IMAGE_EXPORT_DIRECTORY exportDir;
-        ReadProcessMemory(handle, (LPCVOID)(base + ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress), &exportDir, sizeof(exportDir), nullptr);
-
-        auto exportDirRVA = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-        auto exportDirSize = ntHeaders.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
-
-        auto addressOfNames = new DWORD[exportDir.NumberOfNames];
-        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfNames), addressOfNames, exportDir.NumberOfNames * sizeof(DWORD), nullptr);
-
-        auto addressOfFunctions = new DWORD[exportDir.NumberOfFunctions];
-        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfFunctions), addressOfFunctions, exportDir.NumberOfFunctions * sizeof(DWORD), nullptr);
-
-        auto addressOfOrdinals = new WORD[exportDir.NumberOfNames];
-        ReadProcessMemory(handle, (LPCVOID)(base + exportDir.AddressOfNameOrdinals), addressOfOrdinals, exportDir.NumberOfNames * sizeof(WORD), nullptr);
-
-        HANDLE hFile = CreateFileW(dllName, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            current = entry.InMemoryOrderLinks.Flink;
-            return;
-        }
-        HANDLE hMapping = CreateFileMappingW(hFile, nullptr, PAGE_READONLY | SEC_IMAGE, 0, 0, nullptr);
-        auto mappedFile = (BYTE*)MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, 0);
-        CloseHandle(hFile);
-
-        char dllNameC[MAX_PATH];
-        size_t converted;
-        wcstombs_s(&converted, dllNameC, baseName, _TRUNCATE);
-
-        g_results.push_back({ std::format("[+] Scanning: {} ({} exports)", dllNameC, exportDir.NumberOfNames), Severity::Info});
-
-        for (DWORD i = 0; i < exportDir.NumberOfNames; i++) {
-            DWORD funcRVA = addressOfFunctions[addressOfOrdinals[i]];
-
-            if (funcRVA == 0) continue;
-            if (funcRVA >= exportDirRVA && funcRVA < exportDirRVA + exportDirSize) continue;
-            if (!isInTextSection(mappedFile, funcRVA)) continue;
-
-            BYTE remoteBytes[16] = { 0 };
-            ReadProcessMemory(handle, (LPCVOID)(base + funcRVA), remoteBytes, sizeof(remoteBytes), nullptr);
-
-            auto cleanBytes = mappedFile + funcRVA;
-
-            if (memcmp(remoteBytes, cleanBytes, 16) != 0) {
-                char funcName[256];
-                ReadProcessMemory(handle, (LPCVOID)(base + addressOfNames[i]), funcName, sizeof(funcName), nullptr);
-
-                char cleanHex[128], remoteHex[128];
-                int co = 0, ro = 0;
-                for (int j = 0; j < 16; j++) {
-                    co += sprintf_s(cleanHex + co, sizeof(cleanHex) - co, "%02X ", cleanBytes[j]);
-                    ro += sprintf_s(remoteHex + ro, sizeof(remoteHex) - ro, "%02X ", remoteBytes[j]);
-                }
-
-                auto funcAddress = base + funcRVA;
-                auto targetAddress = resolveHookTarget(remoteBytes, funcAddress, handle);
-                auto moduleNameAndOffset = resolveAddressToModule(targetAddress, handle);
-
-                g_results.push_back({ std::format("[!] Hook detected : {}!{}\n    Clean : {}\n    Hooked: {}\n    Resolves to: {}", dllNameC, funcName, cleanHex, remoteHex, moduleNameAndOffset.c_str()), Severity::Detection});
-            }
-        }
-
-        UnmapViewOfFile(mappedFile);
-        CloseHandle(hMapping);
-        delete[] addressOfNames;
-        delete[] addressOfFunctions;
-        delete[] addressOfOrdinals;
-
-        current = entry.InMemoryOrderLinks.Flink;
+    for (auto& mod : g_modules) {
+        //std::cout << mod.name << std::endl;
+        checkInlineHooks(handle, mod);
+        checkIATHooks(handle, mod);
     }
 
-    if (g_results.size() == 0) {
+
+    if (g_results.size() <= 1) {
         g_results.push_back({ "[+] No hooks detected.", Severity::Info });
     }
 
+    cleanupModules();
     CloseHandle(handle);   
     g_scanning = false;
 }
@@ -432,6 +595,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int) {
     fNtQueryInformationProcess = (NtQueryInformationProcess_t*)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationProcess");
 
     enableDebugPrivilege();
+
+    AllocConsole();
+    FILE* fs;
+    freopen_s(&fs, "CONOUT$", "w", stdout);
 
 
     WNDCLASSEXW wc = {
